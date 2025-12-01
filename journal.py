@@ -24,6 +24,13 @@ DIRECTION_OPTIONS = [
     "Short"
 ]
 
+# --- Fixed Cost Constants (Based on user's trading report for 1 contract round-turn) ---
+# Total Commission per 1 round-turn contract (e.g., Broker's flat rate)
+DEFAULT_COMMISSION_PER_CONTRACT = 0.78 
+# Total Fees per 1 round-turn contract (Exchange, NFA, Clearing, etc.)
+DEFAULT_FEES_PER_CONTRACT = 1.12      
+# Total fixed cost per contract: 0.78 + 1.12 = 1.90 
+
 # --- Data Persistence Functions ---
 
 def ensure_image_directory():
@@ -75,16 +82,17 @@ def save_uploaded_file(uploaded_file):
         return None
 
 
-def calculate_pnl(entry, exit, instrument, direction, contracts):
+def calculate_pnl(entry, exit, instrument, direction, contracts, commissions, fees):
     """
-    Calculates the P&L in dollars based on instrument, direction, and contract size.
-    MNQ = $2.00 per point per contract
-    MES = $5.00 per point per contract
+    Calculates the NET P&L in dollars, accounting for instrument point value,
+    direction, contracts, commissions, and fees.
     """
     try:
         entry_price = float(entry)
         exit_price = float(exit)
         num_contracts = int(contracts)
+        commissions = float(commissions)
+        fees = float(fees)
     except (TypeError, ValueError):
         # If any input is invalid or missing, return 0 or an appropriate default
         return 0.0
@@ -109,10 +117,13 @@ def calculate_pnl(entry, exit, instrument, direction, contracts):
         # Long trade: Profit if Exit > Entry. price_diff (Exit - Entry) is directly the points.
         total_points = price_diff
 
-    # 4. Calculate the final dollar P&L
-    pnl = total_points * point_value * num_contracts
+    # 4. Calculate the GROSS dollar P&L
+    gross_pnl = total_points * point_value * num_contracts
     
-    return round(pnl, 2)
+    # 5. Calculate the NET P&L
+    net_pnl = gross_pnl - commissions - fees
+    
+    return round(net_pnl, 2)
 
 # --- Streamlit Session State Handlers ---
 
@@ -155,7 +166,7 @@ def delete_selected_trade():
         # 4. Reset the state to view a new trade
         st.session_state.selected_trade_id = None
         st.toast("Trade deleted successfully!")
-        st.rerun() # Updated from st.experimental_rerun()
+        st.rerun() 
 
 # --- UI Rendering - Trade List ---
 
@@ -171,7 +182,6 @@ def render_trade_list(trades):
     
     st.sidebar.title("Journal History")
     
-    # Emojis removed from button text
     st.sidebar.button("Log New Trade", on_click=start_new_trade, use_container_width=True)
     st.sidebar.markdown("---")
     
@@ -182,7 +192,8 @@ def render_trade_list(trades):
     # Loop through the sorted trades and render a clickable card for each
     for trade in sorted_trades:
         trade_id = trade['id']
-        pnl = trade.get('pnl', 0.0)
+        # The stored P&L is now the NET P&L
+        pnl = trade.get('pnl', 0.0) 
         
         # Determine card color based on P&L
         if pnl > 0:
@@ -217,7 +228,7 @@ def render_trade_list(trades):
                     {trade.get('date', 'N/A')} | {trade.get('contracts', 0)} Contracts
                 </p>
                 <h4 style="color: {color}; margin: 5px 0 0 0; font-size: 18px;">
-                    {sign}${abs(pnl):,.2f}
+                    {sign}${abs(pnl):,.2f} (NET)
                 </h4>
             </div>
         """
@@ -271,11 +282,23 @@ def render_trade_form():
     default_direction = selected_trade_data.get('direction', DIRECTION_OPTIONS[0])
     default_contracts = selected_trade_data.get('contracts', 1)
     
+    # Calculate default costs based on the contract count if it's a NEW trade,
+    # or use saved values if EDITING an existing trade.
+    if is_new:
+        default_commissions = DEFAULT_COMMISSION_PER_CONTRACT * default_contracts
+        default_fees = DEFAULT_FEES_PER_CONTRACT * default_contracts
+    else:
+        default_commissions = selected_trade_data.get('commissions', 0.0)
+        default_fees = selected_trade_data.get('fees', 0.0)
+
+    # Ensure defaults are floats for st.number_input
+    default_commissions = float(default_commissions)
+    default_fees = float(default_fees)
+    
     # Use the index of the instrument/direction for the selectbox value
     instr_index = INSTRUMENT_OPTIONS.index(default_instrument) if default_instrument in INSTRUMENT_OPTIONS else 0
     dir_index = DIRECTION_OPTIONS.index(default_direction) if default_direction in DIRECTION_OPTIONS else 0
 
-    # Removed emoji from header
     st.header(("Log New Trade" if is_new else "Edit Trade"))
     
     # --- Start the Form ---
@@ -293,25 +316,44 @@ def render_trade_form():
         # --- Row 2: Contracts, Entry, Exit ---
         col4, col5, col6 = st.columns(3)
         with col4:
-            contracts = st.number_input("Number of Contracts", min_value=1, value=default_contracts, step=1)
+            # Added a unique key to allow for dynamic calculation if the user changes contracts on a new trade
+            contracts = st.number_input("Number of Contracts", min_value=1, value=default_contracts, step=1, key="contracts_input")
         with col5:
-            # Removed 'e.g.,' from placeholder
             entry = st.text_input("Entry Price", value=selected_trade_data.get('entry', ''), placeholder="15000.25")
         with col6:
-            # Removed 'e.g.,' from placeholder
             exit = st.text_input("Exit Price", value=selected_trade_data.get('exit', ''), placeholder="15010.75")
+        
+        # --- NEW Row 3: Commissions and Fees ---
+        st.subheader("Costs")
+        
+        # RE-CALCULATE DEFAULTS based on current contracts input for new trades
+        # This allows the user to change contract count and see the default cost update, 
+        # though the final submitted value is what matters.
+        if is_new:
+            calculated_commissions = DEFAULT_COMMISSION_PER_CONTRACT * contracts
+            calculated_fees = DEFAULT_FEES_PER_CONTRACT * contracts
+        else:
+            calculated_commissions = default_commissions
+            calculated_fees = default_fees
 
-        # --- Row 3: Setup and Notes ---
-        # Removed 'e.g.,' from placeholder
+        col7, col8 = st.columns(2)
+        with col7:
+            commissions = st.number_input("Commissions Paid ($)", min_value=0.0, value=calculated_commissions, step=0.01, format="%.2f", key="commissions_input_final")
+        with col8:
+            fees = st.number_input("Fees/Slippage ($)", min_value=0.0, value=calculated_fees, step=0.01, format="%.2f", key="fees_input_final")
+
+        st.info(f"The fixed cost for {contracts} contract(s) is $**{calculated_commissions + calculated_fees:.2f}** ($1.90 per contract). You can adjust the numbers above for slippage.")
+
+        # --- Row 4: Setup and Notes ---
+        st.subheader("Analysis")
         setup = st.text_input("Setup Used", 
                               value=selected_trade_data.get('setup', ''), placeholder="VWAP Rejection, S/R Break")
         
-        # Removed placeholder detail
         notes = st.text_area("Trade Notes / Analysis", 
                              value=selected_trade_data.get('notes', ''), placeholder="Detailed analysis of the entry/exit decision.")
 
-        # --- Row 4: Image Management (Reverting to File Uploader) ---
-        st.subheader("Trade Screenshot")
+        # --- Row 5: Image Management (File Uploader) ---
+        st.subheader("Trade Screenshot (Optional)")
         
         # Display existing image if available
         current_image_path = selected_trade_data.get('tradeImagePath')
@@ -336,13 +378,12 @@ def render_trade_form():
         st.markdown("---")
         
         # --- Submit Button ---
-        # Removed emoji from button text
         submitted = st.form_submit_button(("Log Trade" if is_new else "Save Changes"), use_container_width=True, type="primary")
 
     # --- Form Submission Logic ---
     if submitted:
-        # Calculate P&L using the submitted inputs
-        pnl_calculated = calculate_pnl(entry, exit, instrument, direction, contracts)
+        # Calculate P&L using the submitted inputs (now includes commissions/fees)
+        pnl_calculated = calculate_pnl(entry, exit, instrument, direction, contracts, commissions, fees)
         
         new_image_path = current_image_path
         
@@ -386,10 +427,12 @@ def render_trade_form():
             'contracts': contracts,
             'entry': entry,
             'exit': exit,
-            'pnl': pnl_calculated,
+            'commissions': commissions, # New field
+            'fees': fees,               # New field
+            'pnl': pnl_calculated,      # This is now the NET P&L
             'setup': setup,
             'notes': notes,
-            'tradeImagePath': new_image_path, # Use the new or existing path
+            'tradeImagePath': new_image_path,
             'timestamp': datetime.now().isoformat()
         }
 
@@ -404,13 +447,12 @@ def render_trade_form():
         # 5. Save and Refresh
         save_data(st.session_state.trades)
         st.session_state.selected_trade_id = trade_data['id'] # Keep the updated trade selected
-        st.rerun() # Updated from st.experimental_rerun()
+        st.rerun() 
 
     # --- Delete Button (Outside the form, only visible in edit mode) ---
     if not is_new:
         col_delete_out, _ = st.columns([1, 4])
         with col_delete_out:
-            # Removed emoji from button text
             st.button(
                 "Delete Trade", 
                 on_click=delete_selected_trade, 
